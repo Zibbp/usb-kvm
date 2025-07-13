@@ -43,3 +43,7 @@ Connect the USB serial adapter to the Pico
 ## Connecting
 
 Connect the HDMI and Pico USB to a target PC. Connect the single USB Y splitter to your local PC. Open `index.html` in a Chromium browser and connect.
+
+## Debug
+
+Connect the Pico USB to your computer and open a serial connection at 115200 baud rate.
