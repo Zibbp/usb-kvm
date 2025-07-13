@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>USB Web KVM Remote</title>
+  <style>
+    /* Reset default margins and paddings, set background and font */
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: #000;
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+      font-family: sans-serif;
+    }
+
+    /* Styles for the top bar containing the resolution selector */
+    #topBar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 40px;
+      background: rgba(0, 0, 0, 0.85);
+      color: white;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      z-index: 100;
+    }
+
+    /* Styles for the resolution dropdown */
+    #resolutionSelect {
+      background: #111;
+      color: white;
+      border: 1px solid #444;
+      padding: 4px 8px;
+      margin-left: 10px;
+    }
+
+    /* Styles for the video element */
+    video {
+      cursor: none;
+      position: absolute;
+      top: 40px;
+      left: 0;
+      width: 100vw;
+      height: calc(100vh - 40px);
+      object-fit: contain;
+      background: black;
+      display: block;
+      z-index: 1;
+    }
+
+    /* Styles for the controls panel */
+    #controls {
+      position: fixed;
+      bottom: 10px;
+      left: 10px;
+      z-index: 200;
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 10px;
+      border-radius: 8px;
+    }
+
+    /* Styles for buttons within the controls panel */
+    #controls button {
+      margin-right: 0.5em;
+      margin-top: 0.3em;
+    }
+
+    /* Styles for the status display */
+    .status {
+      font-weight: bold;
+      color: lime;
+      display: block;
+      margin-top: 0.5em;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Top bar with resolution selector -->
+  <div id="topBar">
+    Resolution:
+    <select id="resolutionSelect">
+      <option value="1920x1080@30">1920x1080 @ 30fps</option>
+      <option value="1920x1080@25">1920x1080 @ 25fps</option>
+      <option value="1280x720@30">1280x720 @ 30fps</option>
+      <option value="640x480@30">640x480 @ 30fps</option>
+    </select>
+  </div>
+
+  <video id="hdmiVideo" tabindex="0" autoplay playsinline muted></video>
+
+  <!-- Controls panel for user interaction -->
+  <div id="controls">
+    <button id="connect">Connect to Serial</button>
+    <label><input type="checkbox" id="autoReconnect" checked />Auto-Reconnect</label>
+    <button id="resetHID">Reset HID</button>
+    <button id="ctrlaltdelete">Ctrl+Alt+Del</button>
+    <button id="winKey">⊞ Win</button>
+    <input type="text" id="textInput" placeholder="Type text..." />
+    <button id="sendText">Send Text</button>
+    <span class="status" id="status">Not connected</span>
+  </div>
+
+  <script>
+    let currentStream = null;
+    const videoEl = document.getElementById("hdmiVideo");
+
+    // Checks if the browser is Chromium-based
+    function isChromium() {
+      const ua = navigator.userAgent;
+      return (
+        window.chrome !== undefined &&
+        /Chrome|Chromium|Edg|Brave|Vivaldi/i.test(ua) &&
+        navigator.vendor === "Google Inc."
+      );
+    }
+
+    // Parses resolution string into width, height, and frameRate
+    function parseResolution(value) {
+      const [res, fps] = value.split("@");
+      const [width, height] = res.split("x").map(Number);
+      return { width, height, frameRate: Number(fps) };
+    }
+
+    // Finds the MS2109 video capture device
+    async function getMS2109Device() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter((d) => d.kind === "videoinput");
+      return videoDevices.find(
+        (d) => d.label.includes("MS2109") || d.label.toLowerCase().includes("capture")
+      );
+    }
+
+    // Stops the current video stream if it exists
+    async function stopCurrentStream() {
+      if (currentStream) {
+        currentStream.getTracks().forEach((track) => track.stop());
+        currentStream = null;
+      }
+    }
+
+    // Starts video capture with the given settings
+    async function startCaptureFromSettings(settings) {
+      await stopCurrentStream();
+      const device = await getMS2109Device();
+      const constraints = {
+        video: {
+          deviceId: device ? { exact: device.deviceId } : undefined,
+          width: { ideal: settings.width },
+          height: { ideal: settings.height },
+          frameRate: { ideal: settings.frameRate },
+        },
+      };
+
+      try {
+        currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+        videoEl.srcObject = currentStream;
+
+        videoEl.onloadedmetadata = () => {
+          const track = currentStream.getVideoTracks()[0];
+          console.log("Actual video settings:", track.getSettings());
+        };
+      } catch (err) {
+        console.error("Failed to start capture:", err);
+      }
+    }
+
+    // Sets up event listeners for UI elements
+    function initUI() {
+      const dropdown = document.getElementById("resolutionSelect");
+      dropdown.addEventListener("change", () => {
+        const settings = parseResolution(dropdown.value);
+        startCaptureFromSettings(settings);
+      });
+    }
+
+    // Initializes video capture and UI
+    async function initVideo() {
+      if (!isChromium()) {
+        alert(
+          "This application only works in Chromium-based browsers such as Chrome, Edge, Brave, or Vivaldi."
+        );
+        return;
+      }
+
+      initUI();
+      const initialSettings = parseResolution(
+        document.getElementById("resolutionSelect").value
+      );
+      await startCaptureFromSettings(initialSettings);
+    }
+
+    // Serial communication
+    let port, writer, reader;
+    let autoReconnect = true;
+
+    document.getElementById("autoReconnect").addEventListener("change", (e) => {
+      autoReconnect = e.target.checked;
+    });
+
+    // Connects to the serial port and starts reading data
+    async function connectSerial() {
+      try {
+        if (!port) {
+          const ports = await navigator.serial.getPorts();
+          port = ports.length ? ports[0] : await navigator.serial.requestPort();
+        }
+
+        await port.open({ baudRate: 115200 });
+        writer = port.writable.getWriter();
+
+        startReader();
+        document.getElementById("status").textContent = "✅ Connected";
+        console.log("🔌 Serial connected");
+      } catch (err) {
+        console.error("❌ Serial connection failed:", err);
+        document.getElementById("status").textContent = "⚠️ Connection failed";
+      }
+    }
+
+    // Starts reading from the serial port
+    function startReader() {
+      if (!port?.readable) return;
+
+      const textDecoder = new TextDecoderStream();
+      port.readable.pipeTo(textDecoder.writable);
+      reader = textDecoder.readable.getReader();
+
+      (async () => {
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            console.log("📥", value);
+          }
+        } catch (err) {
+          console.warn("🔌 Reader error:", err);
+        } finally {
+          console.warn("Serial disconnected");
+          reader.releaseLock();
+          writer?.releaseLock();
+          writer = null;
+          port = null;
+          document.getElementById("status").textContent = "🔄 Reconnecting...";
+          if (autoReconnect) setTimeout(connectSerial, 2000);
+        }
+      })();
+    }
+
+    // Normalizes key names to match HID usage
+    function normalizeKey(key) {
+      const specialMap = {
+        " ": "spacebar",
+        Enter: "enter",
+        Backspace: "backspace",
+        Control: "ctrl",
+        Shift: "shift",
+        Alt: "alt",
+        Meta: "gui",
+        "'": "quote",
+        '"': "shift+quote",
+        "`": "grave_accent",
+        "~": "shift+grave_accent",
+        "-": "minus",
+        _: "shift+minus",
+        "=": "equals",
+        "+": "shift+equals",
+        "[": "left_bracket",
+        "{": "shift+left_bracket",
+        "]": "right_bracket",
+        "}": "shift+right_bracket",
+        "\\": "backslash",
+        "|": "shift+backslash",
+        ";": "semicolon",
+        ":": "shift+semicolon",
+        ",": "comma",
+        "<": "shift+comma",
+        ".": "period",
+        ">": "shift+period",
+        "/": "forward_slash",
+        "?": "shift+forward_slash",
+        "!": "shift+one",
+        "@": "shift+two",
+        "#": "shift+three",
+        $: "shift+four",
+        "%": "shift+five",
+        "^": "shift+six",
+        "&": "shift+seven",
+        "*": "shift+eight",
+        "(": "shift+nine",
+        ")": "shift+zero",
+      };
+      const navMap = {
+        Escape: "escape",
+        CapsLock: "caps_lock",
+        Insert: "insert",
+        Delete: "delete",
+        Home: "home",
+        End: "end",
+        PageUp: "page_up",
+        PageDown: "page_down",
+        ArrowUp: "up_arrow",
+        ArrowDown: "down_arrow",
+        ArrowLeft: "left_arrow",
+        ArrowRight: "right_arrow",
+      };
+      if (specialMap[key]) return specialMap[key];
+      if (navMap[key]) return navMap[key];
+      if (/^[a-z]$/.test(key)) return key;
+      if (/^[0-9]$/.test(key))
+        return {
+          0: "zero",
+          1: "one",
+          2: "two",
+          3: "three",
+          4: "four",
+          5: "five",
+          6: "six",
+          7: "seven",
+          8: "eight",
+          9: "nine",
+        }[key];
+      return key.toLowerCase();
+    }
+
+    // Sends HID commands over the serial port
+    async function sendHID(obj) {
+      if (!writer) return;
+      const json = JSON.stringify(obj) + "\n";
+      console.log("📤", json.trim());
+      await writer.write(new TextEncoder().encode(json));
+    }
+
+    // Event listeners for buttons
+    document.getElementById("connect").addEventListener("click", connectSerial);
+    document.getElementById("resetHID").addEventListener("click", () =>
+      sendHID({ type: "reset" })
+    );
+    document.getElementById("ctrlaltdelete").addEventListener("click", () => {
+      sendHID({ type: "key", key: "ctrl", press: true });
+      sendHID({ type: "key", key: "alt", press: true });
+      sendHID({ type: "key", key: "delete", press: true });
+      setTimeout(() => {
+        sendHID({ type: "key", key: "delete", press: false });
+        sendHID({ type: "key", key: "alt", press: false });
+        sendHID({ type: "key", key: "ctrl", press: false });
+      }, 100);
+    });
+
+    document.getElementById("winKey").addEventListener("click", () => {
+      sendHID({ type: "key", key: "gui", press: true });
+      setTimeout(() => {
+        sendHID({ type: "key", key: "gui", press: false });
+      }, 150);
+    });
+
+    document.getElementById("sendText").addEventListener("click", () => {
+      sendString(document.getElementById("textInput").value);
+    });
+
+    // Function to send a string as individual key presses
+    async function sendString(text) {
+      for (const ch of text) {
+        const k = normalizeKey(ch);
+        if (!k) continue;
+        await sendHID({ type: "key", key: k, press: true });
+        await sendHID({ type: "key", key: k, press: false });
+        await new Promise(r => setTimeout(r, 50));
+      }
+    }
+
+    // Focus the video element on click or hover (removing duplicate mousedown listener)
+    videoEl.addEventListener("mousedown", () => {
+      videoEl.focus();
+    });
+
+    videoEl.addEventListener("mouseenter", () => {
+      videoEl.focus();
+    });
+
+    // Handle keyboard events only when video is focused
+    window.addEventListener("keydown", e => {
+      if (document.activeElement !== videoEl) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (!e.repeat) {
+        const k = normalizeKey(e.key);
+        if (k) sendHID({ type: "key", key: k, press: true });
+      }
+    }, { capture: true });
+
+    window.addEventListener("keyup", e => {
+      if (document.activeElement !== videoEl) return;
+      const k = normalizeKey(e.key);
+      if (k) sendHID({ type: "key", key: k, press: false });
+    }, { capture: true });
+
+    // Handle mouse events on the video element
+    window.addEventListener("mousedown", e => {
+      if (!videoEl.contains(e.target)) return;
+      const buttonMap = { 0: 1, 2: 2 };
+      if (e.button in buttonMap) {
+        sendHID({ type: "mouse", buttons: buttonMap[e.button], press: true });
+      }
+    });
+
+    window.addEventListener("mouseup", e => {
+      if (!videoEl.contains(e.target)) return;
+      const buttonMap = { 0: 1, 2: 2 };
+      if (e.button in buttonMap) {
+        sendHID({ type: "mouse", buttons: buttonMap[e.button], press: false });
+      }
+    });
+
+    // Absolute mouse position tracking
+    let lastAbsX = null;
+    let lastAbsY = null;
+    let mouseThrottle = false;
+
+    videoEl.addEventListener("contextmenu", e => {
+      e.preventDefault();
+    });
+
+    videoEl.addEventListener("loadedmetadata", () => {
+      videoEl.addEventListener("mousemove", e => {
+        if (!writer || mouseThrottle) return;
+
+        const rect = videoEl.getBoundingClientRect();
+        const srcW = videoEl.videoWidth;
+        const srcH = videoEl.videoHeight;
+        if (!srcW || !srcH) return;
+
+        const elemAR = rect.width / rect.height;
+        const vidAR = srcW / srcH;
+
+        let displayW, displayH, offsetX = 0, offsetY = 0;
+        if (elemAR > vidAR) {
+          displayH = rect.height;
+          displayW = vidAR * displayH;
+          offsetX = (rect.width - displayW) / 2;
+        } else {
+          displayW = rect.width;
+          displayH = displayW / vidAR;
+          offsetY = (rect.height - displayH) / 2;
+        }
+
+        const mx = e.clientX - rect.left - offsetX;
+        const my = e.clientY - rect.top - offsetY;
+        if (mx < 0 || mx > displayW || my < 0 || my > displayH) return;
+
+        const absX = Math.round((mx / displayW) * srcW);
+        const absY = Math.round((my / displayH) * srcH);
+        if (absX === lastAbsX && absY === lastAbsY) return;
+        lastAbsX = absX;
+        lastAbsY = absY;
+
+        sendHID({ type: "mouse_abs", x: absX, y: absY });
+
+        mouseThrottle = true;
+        setTimeout(() => { mouseThrottle = false; }, 16);
+      });
+    });
+
+    // Initialize video on load
+    initVideo();
+  </script>
+</body>
+
+</html>
